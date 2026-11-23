@@ -1,0 +1,14 @@
+{
+  "name": "mihrab-reel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A product-style reel of a gold mirror mihrab, rendered entirely from code (three.js + numpy audio).",
+  "scripts": {
+    "render": "node render.js",
+    "still": "node render.js --still"
+  },
+  "dependencies": {
+    "@fontsource/amiri": "5.1.0",
+    "three": "0.170.0"
+  }
+}

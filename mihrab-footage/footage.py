@@ -20,13 +20,13 @@ import math
 import os
 import subprocess
 import sys
+from multiprocessing import Pool
 
 import cv2
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_W, OUT_H, FPS = 1080, 1920, 30
-DURATION = 20.0
 SRC_W, SRC_H = 941, 1672
 
 
@@ -131,17 +131,40 @@ def gold_mask(img):
 
 
 # ----------------------------------------------------------------------------
-# the edit: (start, end, photo, crop height a->b, centre a->b, camera shift a->b, glint strength)
-# crop heights / centres are in source pixels; shift is px of parallax at disparity 1.
+# Shot library. Crop heights / centres are in source pixels (941x1672 photos);
+# T is the camera shift in px of parallax at disparity 1; glint is the gold highlight;
+# dof = (focus from, focus to, blur per unit of disparity) for a focus pull.
 # ----------------------------------------------------------------------------
-SHOTS = [
-    dict(t0=0.0, t1=3.6, photo="corner", h=(1590, 1380), c=((470, 836), (505, 812)), T=((-28, 0), (28, 0)), glint=0.22),
-    dict(t0=3.6, t1=7.2, photo="side", h=(1540, 1440), c=((470, 836), (462, 830)), T=((26, 0), (-26, 0)), glint=0.25),
-    dict(t0=7.2, t1=10.8, photo="front", h=(860, 790), c=((535, 440), (535, 720)), T=((0, -6), (0, 6)), glint=0.40),
-    dict(t0=10.8, t1=14.4, photo="side", h=(760, 690), c=((725, 640), (742, 905)), T=((-10, 0), (10, 0)), glint=0.45),
-    dict(t0=14.4, t1=20.0, photo="front", h=(1150, 1600), c=((505, 760), (470, 836)), T=((0, -16), (0, 16)), glint=0.25),
-]
-CUTS = [s["t0"] for s in SHOTS[1:]]
+SHOTS = {
+    "corner_dolly":    dict(photo="corner", dur=3.0, h=(1590, 1380), c=((470, 836), (505, 812)), T=((-28, 0), (28, 0)), glint=0.22),
+    "calligraphy_pan": dict(photo="front", dur=3.0, h=(565, 545), c=((330, 285), (690, 280)), T=((8, 0), (-8, 0)), glint=0.55),
+    "lattice_glide":   dict(photo="side", dur=2.6, h=(760, 690), c=((725, 640), (742, 905)), T=((-10, 0), (10, 0)), glint=0.45),
+    "door_reveal":     dict(photo="side", dur=3.2, h=(640, 1300), c=((240, 760), (430, 836)), T=((12, 0), (-12, 0)), glint=0.20),
+    "plant_focus":     dict(photo="front", dur=3.0, h=(700, 640), c=((200, 990), (215, 985)), T=((10, 0), (-10, 0)), glint=0.30,
+                            dof=(0.26, 0.20, 75)),
+    "arch_tilt":       dict(photo="front", dur=2.8, h=(860, 790), c=((535, 440), (535, 720)), T=((0, -6), (0, 6)), glint=0.40),
+    "allah_close":     dict(photo="corner", dur=2.4, h=(470, 420), c=((752, 236), (754, 212)), T=((-6, 0), (6, 0)), glint=0.60),
+    "sunlit_jamb":     dict(photo="corner", dur=2.6, h=(700, 660), c=((455, 800), (480, 560)), T=((-8, 0), (8, 0)), glint=0.45),
+    "rug_rise":        dict(photo="corner", dur=3.2, h=(900, 1000), c=((420, 1210), (520, 700)), T=((0, -20), (0, 20)), glint=0.25,
+                            dof=(0.36, 0.20, 20)),
+    "door_slide":      dict(photo="side", dur=2.8, h=(1540, 1440), c=((470, 836), (462, 830)), T=((26, 0), (-26, 0)), glint=0.25),
+    "front_pullback":  dict(photo="front", dur=4.2, h=(1150, 1600), c=((505, 760), (470, 836)), T=((0, -16), (0, 16)), glint=0.25),
+}
+REEL = ["corner_dolly", "calligraphy_pan", "lattice_glide", "door_reveal", "plant_focus", "arch_tilt",
+        "allah_close", "sunlit_jamb", "rug_rise", "door_slide", "front_pullback"]
+
+
+def timeline():
+    t, out = 0.0, []
+    for name in REEL:
+        out.append((t, t + SHOTS[name]["dur"], name))
+        t += SHOTS[name]["dur"]
+    return out
+
+
+TIMELINE = timeline()
+DURATION = TIMELINE[-1][1]
+CUTS = [round(t0, 3) for t0, _, _ in TIMELINE[1:]]
 
 
 class Scene:
@@ -162,6 +185,12 @@ class Scene:
         self.gold = gold_mask(img) * cv2.GaussianBlur(box, (0, 0), 6)
 
 
+def load_scenes(photos):
+    return {"side": Scene(photos[0], scene_side, (400, 60, 900, 1310)),
+            "front": Scene(photos[1], scene_front, (220, 120, 850, 1075)),
+            "corner": Scene(photos[2], scene_corner, (320, 85, 845, 1060))}
+
+
 def smooth_noise(t, seed):
     return (math.sin(t * 1.7 + seed) * 0.6 + math.sin(t * 3.1 + seed * 2.3) * 0.3 + math.sin(t * 5.3 + seed * 0.7) * 0.1)
 
@@ -173,10 +202,10 @@ VIGNETTE = (1 - 0.28 * np.clip(((U - OUT_W / 2) / (OUT_W * 0.62)) ** 2 + ((V - O
 DUST = rng.random((120, 5))
 
 
-def render(t, scenes):
-    shot = next((s for s in SHOTS if s["t0"] <= t < s["t1"]), SHOTS[-1])
-    sc = scenes[shot["photo"]]
-    k = ease(prog(t, shot["t0"], shot["t1"])) * 0.8 + prog(t, shot["t0"], shot["t1"]) * 0.2
+def render_shot(shot, lt, t, sc):
+    """Render shot `shot` at local time lt (s); t is a global clock for the living details."""
+    p = clamp(lt / shot["dur"])
+    k = ease(p) * 0.8 + p * 0.2
     crop_h = lerp(*shot["h"], k)
     cx = lerp(shot["c"][0][0], shot["c"][1][0], k)
     cy = lerp(shot["c"][0][1], shot["c"][1][1], k)
@@ -206,17 +235,29 @@ def render(t, scenes):
     gold = cv2.remap(sc.gold, mx, my, cv2.INTER_LINEAR, borderValue=0)[..., None]
 
     # moving glint across the mirror gold
-    local = prog(t, shot["t0"], shot["t1"])
-    pos = lerp(-0.25, 1.25, local) * (OUT_W + OUT_H)
+    pos = lerp(-0.25, 1.25, p) * (OUT_W + OUT_H)
     band = np.exp(-(((U * 0.8 + V * 0.6) - pos) / 140.0) ** 2)[..., None]
-    glow = gold * band * shot["glint"]
-    frame = frame + glow * np.array([170, 235, 255], np.float32)          # BGR warm white
-    frame = frame * (1 + gold * 0.06 * math.sin(t * 2.0))                 # gentle breathing of the reflection
+    frame = frame + gold * band * shot["glint"] * np.array([170, 235, 255], np.float32)   # BGR warm white
+    frame = frame * (1 + gold * 0.06 * math.sin(t * 2.0))
 
-    # sharpen (more when zoomed in), bloom, grade
+    # sharpen (more when zoomed in)
     zoom = SRC_H / crop_h
     blur = cv2.GaussianBlur(frame, (0, 0), 1.6)
     frame = frame + (frame - blur) * (0.35 + 0.35 * clamp((zoom - 1) / 1.2))
+
+    # depth of field / focus pull
+    if shot.get("dof"):
+        fa, fb, kk = shot["dof"]
+        focus = lerp(fa, fb, ease(clamp((p - 0.25) / 0.5)))
+        dfin = cv2.remap(sc.depth, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        coc = np.clip(np.abs(dfin - focus) * kk, 0, 7)[..., None]
+        b1 = cv2.GaussianBlur(frame, (0, 0), 2.5)
+        b2 = cv2.GaussianBlur(frame, (0, 0), 7.0)
+        w1 = np.clip(coc / 2.5, 0, 1)
+        w2 = np.clip((coc - 2.5) / 4.5, 0, 1)
+        frame = frame * (1 - w1) + (b1 * (1 - w2) + b2 * w2) * w1
+
+    # bloom + grade
     bright = np.clip(frame - 205, 0, None)
     frame = frame + cv2.GaussianBlur(bright, (0, 0), 22) * 0.35
     frame = frame * np.array([0.97, 1.0, 1.03], np.float32)               # a touch warmer
@@ -232,56 +273,103 @@ def render(t, scenes):
             py = (y * OUT_H - t * (10 + 25 * sp)) % OUT_H
             if lum[int(py), int(px)] < 175:
                 continue
-            r = 1.5 + 2.5 * sz
-            cv2.circle(overlay, (int(px), int(py)), int(r), 1.0, -1, lineType=cv2.LINE_AA)
+            cv2.circle(overlay, (int(px), int(py)), int(1.5 + 2.5 * sz), 1.0, -1, lineType=cv2.LINE_AA)
         overlay = cv2.GaussianBlur(overlay, (0, 0), 1.6)
         frame = frame + overlay[..., None] * 70 * (0.5 + 0.5 * math.sin(t * 2))
 
     frame = frame * VIGNETTE
     g = cv2.resize(GRAIN[int(t * FPS) % len(GRAIN)], (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
-    frame = frame + g[..., None] * 3.2
+    return frame + g[..., None] * 3.2
+
+
+def render(t, scenes):
+    """Frame of the full reel at time t."""
+    t0, _, name = next((x for x in TIMELINE if x[0] <= t < x[1]), TIMELINE[-1])
+    shot = SHOTS[name]
+    frame = render_shot(shot, t - t0, t, scenes[shot["photo"]])
     fade = min(prog(t, 0, 0.45), 1 - prog(t, DURATION - 0.9, DURATION))
     return np.clip(frame * fade, 0, 255).astype(np.uint8)
+
+
+# ----------------------------------------------------------------------------
+# parallel rendering
+# ----------------------------------------------------------------------------
+_SCENES = None
+
+
+def _init(photos):
+    global _SCENES
+    cv2.setNumThreads(1)
+    _SCENES = load_scenes(photos)
+
+
+def _reel_frame(i):
+    return render(i / FPS, _SCENES).tobytes()
+
+
+def _clip_frame(job):
+    name, i = job
+    shot = SHOTS[name]
+    return np.clip(render_shot(shot, i / FPS, i / FPS, _SCENES[shot["photo"]]), 0, 255).astype(np.uint8).tobytes()
+
+
+def encode(path, frames, wav=None):
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+           "-s", f"{OUT_W}x{OUT_H}", "-r", str(FPS), "-i", "-"]
+    if wav:
+        cmd += ["-i", wav]
+    cmd += ["-c:v", "libx264", "-preset", "slow", "-crf", "17", "-pix_fmt", "yuv420p"]
+    cmd += (["-c:a", "aac", "-b:a", "192k", "-shortest"] if wav else ["-an"])
+    cmd += ["-movflags", "+faststart", path]
+    ff = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    for data in frames:
+        ff.stdin.write(data)
+    ff.stdin.close()
+    ff.wait()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--photos", nargs=3, required=True, metavar=("SIDE", "FRONT", "CORNER"))
-    ap.add_argument("--out", default=os.path.join(HERE, "mihrab.mp4"))
-    ap.add_argument("--still", type=float)
+    ap.add_argument("--out", default=os.path.join(HERE, "mihrab.mp4"), help="the edited reel")
+    ap.add_argument("--clips", help="also export every shot as its own silent clip into this folder")
+    ap.add_argument("--only-clips", action="store_true", help="skip the reel")
+    ap.add_argument("--still", type=float, help="render one frame of the reel at this time")
     ap.add_argument("--debug-depth", action="store_true")
+    ap.add_argument("--workers", type=int, default=os.cpu_count())
     args = ap.parse_args()
-    scenes = {"side": Scene(args.photos[0], scene_side, (400, 60, 900, 1310)),
-              "front": Scene(args.photos[1], scene_front, (220, 120, 850, 1075)),
-              "corner": Scene(args.photos[2], scene_corner, (320, 85, 845, 1060))}
     out_dir = os.path.dirname(os.path.abspath(args.out))
-    if args.debug_depth:
-        for name, sc in scenes.items():
-            vis = (sc.depth * 255).astype(np.uint8)
-            vis = cv2.applyColorMap(vis, cv2.COLORMAP_MAGMA)
-            cv2.imwrite(os.path.join(out_dir, f"depth_{name}.png"), np.hstack([sc.img, vis, (np.dstack([sc.gold] * 3) * 255).astype(np.uint8)]))
+
+    if args.debug_depth or args.still is not None:
+        scenes = load_scenes(args.photos)
+        if args.debug_depth:
+            for name, sc in scenes.items():
+                vis = cv2.applyColorMap((sc.depth * 255).astype(np.uint8), cv2.COLORMAP_MAGMA)
+                cv2.imwrite(os.path.join(out_dir, f"depth_{name}.png"),
+                            np.hstack([sc.img, vis, (np.dstack([sc.gold] * 3) * 255).astype(np.uint8)]))
+        else:
+            p = os.path.join(out_dir, f"still_{args.still:05.2f}.png")
+            cv2.imwrite(p, render(args.still, scenes))
+            print(p)
         return
-    if args.still is not None:
-        p = os.path.join(out_dir, f"still_{args.still:05.2f}.png")
-        cv2.imwrite(p, render(args.still, scenes))
-        print(p)
-        return
-    wav = os.path.join(out_dir, "audio.wav")
-    subprocess.run([sys.executable, os.path.join(HERE, "audio.py"), wav, ",".join(str(c) for c in CUTS), str(DURATION)], check=True)
-    ff = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
-                           "-s", f"{OUT_W}x{OUT_H}", "-r", str(FPS), "-i", "-", "-i", wav,
-                           "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-pix_fmt", "yuv420p",
-                           "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", args.out],
-                          stdin=subprocess.PIPE)
-    n = int(DURATION * FPS)
-    for i in range(n):
-        ff.stdin.write(render(i / FPS, scenes).tobytes())
-        if i % 60 == 0:
-            print(f"frame {i}/{n}", file=sys.stderr)
-    ff.stdin.close()
-    ff.wait()
-    os.remove(wav)
-    print("wrote", args.out)
+
+    with Pool(args.workers, initializer=_init, initargs=(args.photos,)) as pool:
+        if not args.only_clips:
+            wav = os.path.join(out_dir, "audio.wav")
+            subprocess.run([sys.executable, os.path.join(HERE, "audio.py"), wav,
+                            ",".join(str(c) for c in CUTS), str(DURATION)], check=True)
+            n = int(round(DURATION * FPS))
+            print(f"reel: {len(REEL)} shots, {DURATION:.1f} s, {n} frames", file=sys.stderr)
+            encode(args.out, pool.imap(_reel_frame, range(n), chunksize=4), wav)
+            os.remove(wav)
+            print("wrote", args.out)
+        if args.clips:
+            os.makedirs(args.clips, exist_ok=True)
+            for idx, (name, shot) in enumerate(SHOTS.items(), 1):
+                n = int(round(shot["dur"] * FPS))
+                path = os.path.join(args.clips, f"{idx:02d}_{name}.mp4")
+                encode(path, pool.imap(_clip_frame, [(name, i) for i in range(n)], chunksize=4))
+                print("wrote", path)
 
 
 if __name__ == "__main__":

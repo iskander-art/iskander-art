@@ -92,16 +92,8 @@ melody = [
     (10.6, 7, 0), (11.6, 6, 0), (12.2, 5, 0), (12.9, 4, 0), (13.6, 3, 0), (14.3, 2, 0), (15.0, 1, 0),
     (15.8, 0, 0), (16.8, 2, 0), (17.5, 1, 0), (18.4, 0, 0),
 ]
-PHRASE_STARTS = [0.0, 3.6, 7.2, 10.6, 15.8]          # where each phrase was written to start
-starts = [0.0] + CUTS
-
-
-def retime(when):
-    i = max(j for j, p in enumerate(PHRASE_STARTS) if when >= p - 1e-6)
-    return when - PHRASE_STARTS[i] + starts[min(i, len(starts) - 1)]
-
-
-melody = [(retime(w), st, o) for (w, st, o) in melody if retime(w) < DURATION - 1.2]
+# the melody was written for 20 s: stretch it to the reel length
+melody = [(w * DURATION / 20.0, st, o) for (w, st, o) in melody if w * DURATION / 20.0 < DURATION - 1.2]
 for when, step, octv in melody:
     f = hz(step, octv)
     place(pluck(f, 3.0, damp=0.997, bright=0.6), when, 0.30, 0.42 + 0.16 * math.sin(step))
@@ -120,7 +112,7 @@ for k in range(int(DURATION / 1.8)):
 # shimmer when the wide shot opens
 for k, step in enumerate([7, 9, 11, 14, 11, 9]):
     place(np.sin(2 * np.pi * hz(step, 1) * np.arange(int(SR * 2.5)) / SR) * np.exp(-np.arange(int(SR * 2.5)) / SR * 2.2),
-          CUTS[2] + k * 0.09, 0.035, 0.2 + 0.12 * k)
+          min(CUTS, key=lambda c: abs(c - DURATION * 0.5)) + k * 0.09, 0.035, 0.2 + 0.12 * k)
 
 L = reverb(L, seed=1)
 R = reverb(R, seed=2)

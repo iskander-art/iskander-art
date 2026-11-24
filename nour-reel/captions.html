@@ -13,6 +13,7 @@
          font: 900 84px/1.25 "Cairo", "AmiriSym", sans-serif; color: #fff;
          -webkit-text-stroke: 3px rgba(20, 14, 6, .85); paint-order: stroke fill;
          text-shadow: 0 4px 18px rgba(0,0,0,.55); transform-origin: 50% 60%; }
+  #cap .line { display: inline-block; white-space: nowrap; }
   #cap .hl { display: inline-block; padding: 0 22px; border-radius: 18px; -webkit-text-stroke: 0; text-shadow: none;
              background: linear-gradient(135deg, #e9c46a, #b8862b); color: #fff;
              box-shadow: 0 0 34px rgba(233, 196, 106, .65), 0 6px 18px rgba(0,0,0,.35); }
@@ -82,7 +83,13 @@ function markup(text, hl) {
 let current = -1;
 window.renderAt = t => {
   const idx = CAPS.findIndex(c => t >= c[0] && t < c[1]);
-  if (idx !== current) { cap.innerHTML = idx >= 0 ? markup(CAPS[idx][2], CAPS[idx][3]) : ""; current = idx; }
+  if (idx !== current) {
+    cap.innerHTML = idx >= 0 ? `<span class="line">${markup(CAPS[idx][2], CAPS[idx][3])}</span>` : "";
+    cap.style.fontSize = "84px";
+    const line = cap.querySelector(".line");
+    if (line && line.offsetWidth > 940) cap.style.fontSize = `${Math.floor(84 * 940 / line.offsetWidth)}px`;
+    current = idx;
+  }
   if (idx >= 0) {
     const k = clamp((t - CAPS[idx][0]) / 0.18);
     const s = 0.75 + 0.25 * backOut(k);

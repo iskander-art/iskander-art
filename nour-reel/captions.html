@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ar">
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face { font-family: "Cairo"; font-weight: 900; src: url("fonts/cairo-arabic-900-normal.woff2") format("woff2"); unicode-range: U+0600-06FF, U+0750-077F, U+FB50-FDFF, U+FE70-FEFF; }
+  @font-face { font-family: "Cairo"; font-weight: 900; src: url("fonts/cairo-latin-900-normal.woff2") format("woff2"); unicode-range: U+0000-00FF, U+2000-206F; }
+  @font-face { font-family: "Cairo"; font-weight: 700; src: url("fonts/cairo-arabic-700-normal.woff2") format("woff2"); unicode-range: U+0600-06FF, U+0750-077F, U+FB50-FDFF, U+FE70-FEFF; }
+  @font-face { font-family: "Cairo"; font-weight: 700; src: url("fonts/cairo-latin-700-normal.woff2") format("woff2"); unicode-range: U+0000-00FF, U+2000-206F; }
+  @font-face { font-family: "AmiriSym"; font-weight: 700; src: url("fonts/amiri-arabic-700-normal.woff2") format("woff2"); }
+  html, body { margin: 0; width: 1080px; height: 1920px; background: transparent; overflow: hidden; }
+  #cap { position: absolute; left: 60px; right: 60px; top: 1250px; text-align: center; direction: rtl;
+         font: 900 84px/1.25 "Cairo", "AmiriSym", sans-serif; color: #fff;
+         -webkit-text-stroke: 3px rgba(20, 14, 6, .85); paint-order: stroke fill;
+         text-shadow: 0 4px 18px rgba(0,0,0,.55); transform-origin: 50% 60%; }
+  #cap .hl { display: inline-block; padding: 0 22px; border-radius: 18px; -webkit-text-stroke: 0; text-shadow: none;
+             background: linear-gradient(135deg, #e9c46a, #b8862b); color: #fff;
+             box-shadow: 0 0 34px rgba(233, 196, 106, .65), 0 6px 18px rgba(0,0,0,.35); }
+  #cap .sym { font-family: "AmiriSym", "Cairo", serif; font-weight: 700; }
+  #cap .latin { direction: ltr; unicode-bidi: isolate; display: inline-block; letter-spacing: 1px; }
+  #end { position: absolute; inset: 0; opacity: 0; display: grid; place-items: center; direction: rtl;
+         background: radial-gradient(circle at 50% 42%, #3a2a12 0%, #1d150a 55%, #0d0905 100%); }
+  #end .box { display: grid; justify-items: center; gap: 26px; text-align: center; }
+  #end .mark { width: 170px; height: 170px; position: relative; }
+  #end .mark svg { width: 100%; height: 100%; }
+  #end .brand { font: 900 92px/1 "Cairo", sans-serif; color: #f4dc9a; letter-spacing: 2px; direction: ltr; }
+  #end .slogan { font: 900 96px/1.1 "Cairo", sans-serif; color: #fff; }
+  #end .bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #b8862b, #f4dc9a, #b8862b); }
+  #end .cta { font: 700 50px/1.3 "Cairo", sans-serif; color: #f4dc9a; }
+  #end .handle { font: 700 46px/1 "Cairo", sans-serif; color: #fff; opacity: .9; direction: ltr; }
+</style>
+</head>
+<body>
+<div id="cap"></div>
+<div id="end"><div class="box">
+  <div class="mark"><svg viewBox="-50 -50 100 100" aria-hidden="true">
+    <g fill="none" stroke="#e9c46a" stroke-width="3.2" stroke-linejoin="round">
+      <rect x="-30" y="-30" width="60" height="60"/>
+      <rect x="-30" y="-30" width="60" height="60" transform="rotate(45)"/>
+      <circle r="12"/>
+    </g></svg></div>
+  <div class="brand">The Nour Gallery</div>
+  <div class="slogan">نوّري دارك</div>
+  <div class="bar"></div>
+  <div class="cta">راسلينا فالخاص</div>
+  <div class="handle">@thenourgallery</div>
+</div></div>
+<script>
+// [start, end, text, highlighted part]
+const CAPS = [
+  [0.05, 0.95, "عندك حيط فارغ", "فارغ"],
+  [0.95, 1.95, "فالدار؟", null],
+  [1.95, 2.80, "خليه يولّي", null],
+  [2.80, 4.30, "ركن الصلاة تاعك!", "ركن الصلاة"],
+  [4.35, 5.68, "محراب ذهبي…", "ذهبي"],
+  [5.70, 7.08, "مقصوص بدقة،", "بدقة"],
+  [7.11, 8.74, "وتفاصيلو تلمع مع الضو", "تلمع"],
+  [9.28, 10.98, "فوقو اسم الله…", "الله"],
+  [11.04, 14.30, "واسم سيدنا محمد ﷺ", "محمد ﷺ"],
+  [14.42, 15.58, "ركن صغير…", null],
+  [15.63, 17.28, "يجيب الراحة والسكينة", "الراحة"],
+  [17.30, 18.30, "لدارك كاملة", null],
+  [18.34, 19.80, "بلاصة فين تصلّي", null],
+  [19.83, 20.68, "العايلة كاملة", "العايلة"],
+  [20.71, 22.22, "حابّة واحد كيما هذا؟", null],
+  [22.27, 24.25, "راسلينا فالخاص!", "فالخاص"],
+  [24.42, 25.78, "The Nour Gallery", null],
+  [25.82, 26.96, "نوّري دارك", "نوّري"],
+];
+const END_AT = 26.96;
+const cap = document.getElementById("cap"), end = document.getElementById("end");
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const backOut = x => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+function markup(text, hl) {
+  const wrap = s => esc(s).replace(/ﷺ/g, '<span class="sym">ﷺ</span>');
+  if (/^[A-Za-z]/.test(text)) return `<span class="latin">${esc(text)}</span>`;
+  if (!hl || !text.includes(hl)) return wrap(text);
+  const i = text.indexOf(hl);
+  return wrap(text.slice(0, i)) + `<span class="hl">${wrap(hl)}</span>` + wrap(text.slice(i + hl.length));
+}
+let current = -1;
+window.renderAt = t => {
+  const idx = CAPS.findIndex(c => t >= c[0] && t < c[1]);
+  if (idx !== current) { cap.innerHTML = idx >= 0 ? markup(CAPS[idx][2], CAPS[idx][3]) : ""; current = idx; }
+  if (idx >= 0) {
+    const k = clamp((t - CAPS[idx][0]) / 0.18);
+    const s = 0.75 + 0.25 * backOut(k);
+    const out = clamp((CAPS[idx][1] - t) / 0.08);
+    cap.style.transform = `translateY(${30 * (1 - k)}px) scale(${s})`;
+    cap.style.opacity = Math.min(k * 1.6, 1) * out;
+  }
+  // end card
+  const e = t - END_AT;
+  end.style.opacity = clamp(e / 0.3);
+  if (e > 0) cap.style.opacity = 0;
+  const mark = end.querySelector(".mark");
+  const ks = backOut(clamp((e - 0.05) / 0.5));
+  mark.style.transform = `scale(${0.6 + 0.4 * ks}) rotate(${(1 - ks) * -45}deg)`;
+  mark.style.opacity = clamp((e - 0.05) / 0.3);
+  end.querySelector(".brand").style.opacity = clamp((e - 0.15) / 0.3);
+  const sl = end.querySelector(".slogan");
+  sl.style.opacity = clamp((e - 0.3) / 0.3);
+  sl.style.transform = `translateY(${24 * (1 - clamp((e - 0.3) / 0.3))}px)`;
+  end.querySelector(".bar").style.width = `${520 * clamp((e - 0.45) / 0.5)}px`;
+  end.querySelector(".cta").style.opacity = clamp((e - 0.7) / 0.3);
+  end.querySelector(".handle").style.opacity = clamp((e - 0.85) / 0.3) * 0.9;
+};
+window.CAP_TIMES = CAPS.filter(c => c[3]).map(c => c[0]);
+window.ready = document.fonts.ready.then(() => Promise.all([
+  document.fonts.load('900 84px "Cairo"', "عندك"), document.fonts.load('900 84px "Cairo"', "Nour"),
+  document.fonts.load('700 84px "AmiriSym"', "ﷺ")])).then(() => true);
+</script>
+</body>
+</html>

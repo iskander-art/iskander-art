@@ -1,0 +1,833 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mihrab reel</title>
+<style>
+  @font-face { font-family: "Amiri"; font-weight: 700;
+    src: url("node_modules/@fontsource/amiri/files/amiri-arabic-700-normal.woff2") format("woff2"); }
+  @font-face { font-family: "Amiri"; font-weight: 400;
+    src: url("node_modules/@fontsource/amiri/files/amiri-arabic-400-normal.woff2") format("woff2"); }
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  #wrap { position: relative; width: 1080px; height: 1920px; }
+  canvas#gl { position: absolute; inset: 0; }
+  #vignette { position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse 75% 65% at 50% 48%, rgba(0,0,0,0) 55%, rgba(20,12,4,0.38) 100%); }
+  #grain { position: absolute; inset: 0; opacity: 0.06; mix-blend-mode: overlay; }
+  #fade { position: absolute; inset: 0; background: #000; opacity: 0; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "./node_modules/three/build/three.module.js",
+    "three/addons/": "./node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gl" width="1080" height="1920"></canvas>
+  <canvas id="grain" width="540" height="960"></canvas>
+  <div id="vignette"></div>
+  <div id="fade"></div>
+</div>
+<script type="module">
+import * as THREE from "three";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+// ===========================================================================
+// Small helpers
+// ===========================================================================
+const W = 1080, H = 1920;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+const smooth = x => x * x * (3 - 2 * x);
+const easeIO = x => x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const lerp = (a, b, k) => a + (b - a) * k;
+const lerp3 = (a, b, k) => [lerp(a[0], b[0], k), lerp(a[1], b[1], k), lerp(a[2], b[2], k)];
+
+let seed = 12345;
+const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+
+function makeCanvas(w, h) {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  return [c, c.getContext("2d")];
+}
+
+function canvasTexture(c, { srgb = true, repeat = null, aniso = 8 } = {}) {
+  const t = new THREE.CanvasTexture(c);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = aniso;
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(...repeat); }
+  return t;
+}
+
+// ===========================================================================
+// Geometry of the lattice: 4.6.12 tiling + Hankin's "polygons in contact"
+// ===========================================================================
+function regularPolygon(cx, cy, n, R, rot) {
+  const p = [];
+  for (let k = 0; k < n; k++) p.push([cx + R * Math.cos(rot + 2 * Math.PI * k / n), cy + R * Math.sin(rot + 2 * Math.PI * k / n)]);
+  return p;
+}
+function rot2(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0] * c - v[1] * s, v[0] * s + v[1] * c]; }
+function intersect(p, d, q, e) {
+  const den = d[0] * e[1] - d[1] * e[0];
+  if (Math.abs(den) < 1e-12) return null;
+  const s = ((q[0] - p[0]) * e[1] - (q[1] - p[1]) * e[0]) / den;
+  return [p[0] + s * d[0], p[1] + s * d[1]];
+}
+function hankin(poly, theta) {
+  const n = poly.length, mids = [], dirs = [];
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n];
+    mids.push([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    dirs.push([(b[0] - a[0]) / L, (b[1] - a[1]) / L]);
+  }
+  const star = [];
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    const x = intersect(mids[i], rot2(dirs[i], theta), mids[j], rot2([-dirs[j][0], -dirs[j][1]], -theta));
+    star.push(mids[i], x);
+  }
+  return star;
+}
+
+/** Returns {stars: [[pts...]], circles: [[x,y,r]]} covering the box. */
+function tiling4612(a, theta, origin, box) {
+  const d = a * (2 + Math.sqrt(3)) + a;          // centre spacing of the 12-gons
+  const R12 = a / (2 * Math.sin(Math.PI / 12));
+  const e1 = [d, 0], e2 = [d / 2, d * Math.sqrt(3) / 2];
+  const out = { stars: [], circles: [] };
+  const N = Math.ceil(Math.max(box[2] - box[0], box[3] - box[1]) / d) + 3;
+  for (let i = -N; i <= N; i++) for (let j = -N; j <= N; j++) {
+    const cx = origin[0] + i * e1[0] + j * e2[0], cy = origin[1] + i * e1[1] + j * e2[1];
+    if (cx < box[0] - d || cx > box[2] + d || cy < box[1] - d || cy > box[3] + d) continue;
+    const p12 = regularPolygon(cx, cy, 12, R12, Math.PI / 12);
+    out.stars.push(hankin(p12, theta));
+    out.circles.push([cx, cy, R12 * 0.25]);
+    for (const u of [e1, e2, [e2[0] - e1[0], e2[1] - e1[1]]]) {     // squares between 12-gons
+      const ang = Math.atan2(u[1], u[0]);
+      out.stars.push(hankin(regularPolygon(cx + u[0] / 2, cy + u[1] / 2, 4, a / Math.SQRT2, ang + Math.PI / 4), theta));
+    }
+    for (const k of [1 / 3, 2 / 3]) {                                // hexagons in the triangles
+      const gx = cx + (e1[0] + e2[0]) * k, gy = cy + (e1[1] + e2[1]) * k;
+      out.stars.push(hankin(regularPolygon(gx, gy, 6, a, 0), theta));
+    }
+  }
+  return out;
+}
+
+function strokeStars(ctx, pat, tx) {
+  ctx.beginPath();
+  for (const st of pat.stars) {
+    const n = st.length;
+    for (let i = 0; i < n; i += 2) {
+      const m = tx(st[i]), x = tx(st[i + 1]), m2 = tx(st[(i + 2) % n]);
+      ctx.moveTo(m[0], m[1]); ctx.lineTo(x[0], x[1]); ctx.lineTo(m2[0], m2[1]);
+    }
+  }
+  ctx.stroke();
+  for (const [cx, cy, r] of pat.circles) {
+    const c = tx([cx, cy]);
+    ctx.beginPath();
+    ctx.arc(c[0], c[1], r * tx.s, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
+// ===========================================================================
+// The mihrab panel (measured from the photos, metres, origin = bottom centre)
+// ===========================================================================
+const PANEL_W = 1.10, PANEL_H = 1.70, PANEL_Y = 0.22;   // bottom edge 22 cm above the floor
+const BORDER = 0.028;
+
+function cubic(p0, p1, p2, p3, n) {
+  const out = [];
+  for (let k = 1; k <= n; k++) {
+    const t = k / n, u = 1 - t;
+    out.push([u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+              u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1]]);
+  }
+  return out;
+}
+
+/** The opening: straight jambs, a small stepped shoulder, then an onion arch with a pointed tip. */
+function openingContour() {
+  const half = [[0.30, -0.02], [0.30, 1.00], [0.236, 1.046]];
+  half.push(...cubic([0.236, 1.046], [0.335, 1.10], [0.325, 1.335], [0.155, 1.430], 40));
+  half.push(...cubic([0.155, 1.430], [0.082, 1.472], [0.016, 1.492], [0, 1.535], 24));
+  const left = half.map(([x, y]) => [-x, y]);
+  return [...left, ...half.slice(0, -1).reverse()];  // left bottom -> apex -> right bottom
+}
+
+function drawPanelAlpha() {
+  const S = 2300;                         // px per metre
+  const cw = Math.round(PANEL_W * S), ch = Math.round(PANEL_H * S);
+  const [c, ctx] = makeCanvas(cw, ch);
+  const tx = p => [(p[0] + PANEL_W / 2) * S, (PANEL_H - p[1]) * S];
+  tx.s = S;
+  const opening = openingContour();
+  const openingPath = () => {
+    ctx.beginPath();
+    opening.forEach((p, i) => { const q = tx(p); i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); });
+    ctx.closePath();
+  };
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cw, ch);
+  ctx.save();
+  // clip to material region: rectangle minus opening
+  ctx.beginPath();
+  ctx.rect(0, 0, cw, ch);
+  opening.forEach((p, i) => { const q = tx(p); i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); });
+  ctx.closePath();
+  ctx.clip("evenodd");
+  // lattice
+  const pat = tiling4612(0.041, (62 * Math.PI) / 180, [0, 1.66], [-0.6, 0, 0.6, 1.75]);
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 0.0088 * S; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  strokeStars(ctx, pat, tx);
+  // plain mirror borders
+  ctx.lineWidth = BORDER * S;
+  ctx.strokeRect(BORDER * S / 2, BORDER * S / 2, cw - BORDER * S, ch - BORDER * S);
+  ctx.lineWidth = BORDER * 2 * S;
+  ctx.lineJoin = "miter";
+  openingPath(); ctx.stroke();
+  ctx.restore();
+  // round every corner a little, like a laser kerf (threshold happens in the shader)
+  const [c2, ctx2] = makeCanvas(cw, ch);
+  ctx2.filter = "blur(2.2px)";
+  ctx2.drawImage(c, 0, 0);
+  return c2;
+}
+
+// ===========================================================================
+// Calligraphy pieces
+// ===========================================================================
+function ringLattice(ctx, cx, cy, r0, r1, scale, S) {
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, r1, 0, Math.PI * 2); ctx.arc(cx, cy, r0, 0, Math.PI * 2, true); ctx.clip();
+  const pat = tiling4612(scale, (60 * Math.PI) / 180, [0, 0], [-1, -1, 1, 1]);
+  const tx = p => [cx + p[0] * S, cy - p[1] * S]; tx.s = S;
+  strokeStars(ctx, pat, tx);
+  ctx.restore();
+}
+
+function fitText(ctx, text, maxW, maxH, weight = 700) {
+  let size = maxH;
+  for (; size > 10; size -= 4) {
+    ctx.font = `${weight} ${size}px Amiri`;
+    if (ctx.measureText(text).width <= maxW) break;
+  }
+  return size;
+}
+
+function medallionTextures(text) {
+  const N = 1024, r = N / 2;
+  const [c, ctx] = makeCanvas(N, N);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, N, N);
+  ctx.strokeStyle = ctx.fillStyle = "#fff"; ctx.lineJoin = "round";
+  ctx.lineWidth = 20; ctx.beginPath(); ctx.arc(r, r, r - 12, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineWidth = 9; ctx.beginPath(); ctx.arc(r, r, r * 0.74, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineWidth = 7;
+  ringLattice(ctx, r, r, r * 0.74, r - 12, 0.055, r);
+  const size = fitText(ctx, text, N * 0.56, N * 0.42);
+  ctx.font = `700 ${size}px Amiri`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.direction = "rtl";
+  ctx.fillText(text, r, r + size * 0.08);
+  const [c2, ctx2] = makeCanvas(N, N);
+  ctx2.filter = "blur(1.2px)"; ctx2.drawImage(c, 0, 0);
+  return c2;
+}
+
+/** Cartouche outline (normalised -1..1): flat top/bottom, each end = concave notch + round lobe + small point. */
+function cartoucheShape2D(aspect) {
+  const sx = 1 - 0.50 / aspect, lobeC = 1 - 0.30 / aspect, lobeR = 0.24 / aspect;
+  const R = [[sx, 1]];
+  for (let k = 1; k <= 12; k++) { const a = (k / 12) * Math.PI / 2; R.push([sx + (1 - Math.cos(a)) * (lobeC - sx), 1 - Math.sin(a) * 0.28]); }
+  for (let k = 1; k < 40; k++) {
+    const a = Math.PI / 2 - (k / 40) * Math.PI;
+    R.push(k === 20 ? [lobeC + lobeR + 0.07 / aspect, 0] : [lobeC + Math.cos(a) * lobeR, Math.sin(a) * 0.72]);
+  }
+  for (let k = 0; k <= 12; k++) { const a = Math.PI / 2 - (k / 12) * Math.PI / 2; R.push([sx + (1 - Math.cos(a)) * (lobeC - sx), -1 + Math.sin(a) * 0.28]); }
+  return [...R, ...R.map(([x, y]) => [-x, y]).reverse()];
+}
+
+function cartoucheTextures(text, wM, hM) {
+  const S = 2600, cw = Math.round(wM * S), ch = Math.round(hM * S);
+  const aspect = wM / hM;
+  const shape = cartoucheShape2D(aspect);
+  const tx = p => [(p[0] + 1) / 2 * cw, (1 - p[1]) / 2 * ch];
+  const [c, ctx] = makeCanvas(cw, ch);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cw, ch);
+  ctx.strokeStyle = ctx.fillStyle = "#fff";
+  ctx.lineJoin = "round";
+  ctx.save();
+  ctx.beginPath(); shape.forEach((p, i) => { const q = tx(p); i ? ctx.lineTo(...q) : ctx.moveTo(...q); }); ctx.closePath();
+  ctx.clip();
+  ctx.lineWidth = 34; ctx.stroke();
+  ctx.restore();
+  const size = fitText(ctx, text, cw * 0.80, ch * 0.62);
+  ctx.font = `700 ${size}px Amiri`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.direction = "rtl";
+  ctx.fillText(text, cw / 2, ch / 2 + size * 0.06);
+  const [c2, ctx2] = makeCanvas(cw, ch);
+  ctx2.filter = "blur(1.2px)"; ctx2.drawImage(c, 0, 0);
+  return { alpha: c2, shape };
+}
+
+// ===========================================================================
+// Room textures
+// ===========================================================================
+function marbleTexture() {
+  const N = 1024;
+  const [c, ctx] = makeCanvas(N, N);
+  ctx.fillStyle = "#e9dccb"; ctx.fillRect(0, 0, N, N);
+  // soft clouds
+  for (let i = 0; i < 260; i++) {
+    const x = rand() * N, y = rand() * N, r = 30 + rand() * 140;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    const tone = rand() < 0.5 ? "214,196,172" : "245,236,224";
+    g.addColorStop(0, `rgba(${tone},0.18)`); g.addColorStop(1, `rgba(${tone},0)`);
+    ctx.fillStyle = g; ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+  }
+  // veins
+  for (let i = 0; i < 18; i++) {
+    ctx.beginPath();
+    let x = rand() * N, y = rand() * N, a = rand() * Math.PI * 2;
+    ctx.moveTo(x, y);
+    for (let k = 0; k < 60; k++) { a += (rand() - 0.5) * 0.6; x += Math.cos(a) * 9; y += Math.sin(a) * 9; ctx.lineTo(x, y); }
+    ctx.strokeStyle = `rgba(170,150,125,${0.10 + rand() * 0.2})`; ctx.lineWidth = 0.6 + rand() * 1.6; ctx.stroke();
+  }
+  // grout (tile = whole texture)
+  ctx.strokeStyle = "rgba(150,135,115,0.9)"; ctx.lineWidth = 4;
+  ctx.strokeRect(0, 0, N, N);
+  return c;
+}
+
+function rugTextures(wM, lM) {
+  const S = 1100, cw = Math.round(wM * S), ch = Math.round(lM * S);
+  const fr = Math.round(0.05 * S);                         // fringe length
+  const [c, ctx] = makeCanvas(cw, ch + 2 * fr);
+  const [b, bx] = makeCanvas(cw, ch + 2 * fr);             // bump
+  const [a, ax] = makeCanvas(cw, ch + 2 * fr);             // alpha
+  ctx.fillStyle = "#7d8566"; ctx.fillRect(0, fr, cw, ch);
+  bx.fillStyle = "#808080"; bx.fillRect(0, 0, cw, ch + 2 * fr);
+  ax.fillStyle = "#000"; ax.fillRect(0, 0, cw, ch + 2 * fr); ax.fillStyle = "#fff"; ax.fillRect(0, fr, cw, ch);
+  // pile noise
+  for (let i = 0; i < 26000; i++) {
+    const x = rand() * cw, y = fr + rand() * ch;
+    ctx.fillStyle = rand() < 0.5 ? "rgba(60,66,45,0.18)" : "rgba(170,175,140,0.12)";
+    ctx.fillRect(x, y, 2, 2);
+  }
+  const line = (pts, w, col, bump) => {
+    for (const [g, style, lw] of [[ctx, col, w], [bx, bump, w * 1.4]]) {
+      g.beginPath(); pts.forEach((p, i) => i ? g.lineTo(p[0], p[1] + fr) : g.moveTo(p[0], p[1] + fr));
+      g.strokeStyle = style; g.lineWidth = lw; g.lineJoin = "round"; g.stroke();
+    }
+  };
+  const rect = (m) => [[m, m], [cw - m, m], [cw - m, ch - m], [m, ch - m], [m, m]];
+  // dark outer band
+  ctx.fillStyle = "rgba(70,78,52,0.55)";
+  ctx.fillRect(0, fr, cw, 0.045 * S); ctx.fillRect(0, fr + ch - 0.045 * S, cw, 0.045 * S);
+  ctx.fillRect(0, fr, 0.045 * S, ch); ctx.fillRect(cw - 0.045 * S, fr, 0.045 * S, ch);
+  for (const [m, w] of [[0.045, 3], [0.06, 5], [0.085, 3], [0.10, 2]]) line(rect(m * S), w, "rgba(226,222,196,0.85)", "#d8d8d8");
+  // meander in the border
+  const step = 0.02 * S;
+  for (let x = 0.07 * S; x < cw - 0.07 * S; x += step) {
+    line([[x, 0.068 * S], [x + step / 2, 0.078 * S], [x + step, 0.068 * S]], 2, "rgba(226,222,196,0.6)", "#c0c0c0");
+    line([[x, ch - 0.068 * S], [x + step / 2, ch - 0.078 * S], [x + step, ch - 0.068 * S]], 2, "rgba(226,222,196,0.6)", "#c0c0c0");
+  }
+  // the arch motif at the head of the rug (end near the wall = top of the texture)
+  const archPts = [];
+  const iw = cw / 2 - 0.14 * S, base = 0.55 * S, spring = 0.30 * S, apex = 0.13 * S;
+  archPts.push([cw / 2 - iw, ch - 0.14 * S], [cw / 2 - iw, spring]);
+  for (let k = 0; k <= 40; k++) {
+    const t = k / 40;
+    archPts.push([cw / 2 - iw * (1 - t) * (1 - 0.15 * Math.sin(t * Math.PI)), spring - (spring - apex) * Math.sin(t * Math.PI / 2) ** 1.4]);
+  }
+  for (let k = 40; k >= 0; k--) {
+    const t = k / 40;
+    archPts.push([cw / 2 + iw * (1 - t) * (1 - 0.15 * Math.sin(t * Math.PI)), spring - (spring - apex) * Math.sin(t * Math.PI / 2) ** 1.4]);
+  }
+  archPts.push([cw / 2 + iw, ch - 0.14 * S], [cw / 2 - iw, ch - 0.14 * S]);
+  line(archPts, 4, "rgba(226,222,196,0.8)", "#e0e0e0");
+  // vines filling the field
+  for (let i = 0; i < 90; i++) {
+    let x = 0.16 * S + rand() * (cw - 0.32 * S), y = 0.2 * S + rand() * (ch - 0.4 * S), ang = rand() * 6.28;
+    const pts = [[x, y]];
+    for (let k = 0; k < 14; k++) { ang += 0.35 + (rand() - 0.5) * 0.3; x += Math.cos(ang) * 7; y += Math.sin(ang) * 7; pts.push([x, y]); }
+    line(pts, 2, "rgba(200,204,170,0.45)", "#b0b0b0");
+  }
+  // fringe threads
+  for (let x = 4; x < cw - 2; x += 6) {
+    for (const [y0, y1] of [[fr, 2], [fr + ch, ch + 2 * fr - 2]]) {
+      const wob = (rand() - 0.5) * 8;
+      for (const [g, style] of [[ctx, "#efe9dc"], [ax, "#fff"], [bx, "#c8c8c8"]]) {
+        g.beginPath(); g.moveTo(x, y0); g.quadraticCurveTo(x + wob, (y0 + y1) / 2, x + wob * 1.5, y1);
+        g.strokeStyle = style; g.lineWidth = 3.4; g.stroke();
+      }
+    }
+  }
+  return { color: c, bump: b, alpha: a, fringe: 0.05 };
+}
+
+function potTexture() {
+  const [c, ctx] = makeCanvas(1024, 512);
+  ctx.fillStyle = "#efe8d8"; ctx.fillRect(0, 0, 1024, 512);
+  for (let i = 0; i < 9; i++) {
+    const x = 60 + i * 113, y = 250 + Math.sin(i) * 40;
+    for (let k = 0; k < 6; k++) {
+      ctx.save(); ctx.translate(x, y); ctx.rotate(k * Math.PI / 3);
+      ctx.fillStyle = k % 2 ? "rgba(64,110,96,0.75)" : "rgba(60,90,140,0.7)";
+      ctx.beginPath(); ctx.ellipse(0, -22, 9, 22, 0, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    }
+    ctx.fillStyle = "#c9a34a"; ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "rgba(64,110,96,0.7)"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(x + 30, y + 10); ctx.bezierCurveTo(x + 60, y - 60, x + 80, y + 60, x + 110, y - 10); ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(120,140,120,0.5)"; ctx.fillRect(0, 30, 1024, 6); ctx.fillRect(0, 470, 1024, 6);
+  return c;
+}
+
+function bookTexture() {
+  const [c, ctx] = makeCanvas(512, 720);
+  ctx.fillStyle = "#1f4a3a"; ctx.fillRect(0, 0, 512, 720);
+  ctx.strokeStyle = "#d6b25c"; ctx.lineWidth = 8; ctx.strokeRect(30, 30, 452, 660);
+  ctx.lineWidth = 3; ctx.strokeRect(50, 50, 412, 620);
+  ctx.save(); ctx.translate(256, 360);
+  for (let k = 0; k < 16; k++) { ctx.rotate(Math.PI / 8); ctx.beginPath(); ctx.ellipse(0, -70, 18, 50, 0, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.fillStyle = "#d6b25c"; ctx.beginPath(); ctx.arc(0, 0, 28, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  return c;
+}
+
+function woodTexture() {
+  const [c, ctx] = makeCanvas(512, 512);
+  ctx.fillStyle = "#5b2f1a"; ctx.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 140; i++) {
+    const y = rand() * 512;
+    ctx.strokeStyle = `rgba(${rand() < 0.5 ? "30,14,6" : "120,70,40"},${0.15 + rand() * 0.25})`;
+    ctx.lineWidth = 1 + rand() * 3;
+    ctx.beginPath(); ctx.moveTo(0, y);
+    for (let x = 0; x <= 512; x += 32) ctx.lineTo(x, y + Math.sin(x * 0.02 + i) * 4);
+    ctx.stroke();
+  }
+  return c;
+}
+
+function curtainTexture() {
+  const [c, ctx] = makeCanvas(512, 1024);
+  ctx.fillStyle = "rgba(255,255,255,0.40)"; ctx.fillRect(0, 0, 512, 1024);
+  // lace motifs, denser at the bottom
+  for (let i = 0; i < 600; i++) {
+    const y = 1024 - Math.pow(rand(), 2.2) * 1024, x = rand() * 512;
+    ctx.strokeStyle = "rgba(255,255,255,0.65)"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.ellipse(x, y, 6 + rand() * 8, 3 + rand() * 6, rand() * 3, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.fillRect(0, 990, 512, 34);
+  return c;
+}
+
+function windowViewTexture() {
+  const [c, ctx] = makeCanvas(512, 768);
+  const g = ctx.createLinearGradient(0, 0, 0, 768);
+  g.addColorStop(0, "#dfeaf3"); g.addColorStop(0.5, "#f4f1e8"); g.addColorStop(1, "#c8d0b0");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 512, 768);
+  ctx.filter = "blur(18px)";
+  for (let i = 0; i < 40; i++) {
+    ctx.fillStyle = `rgba(${70 + rand() * 40},${110 + rand() * 50},${60 + rand() * 30},0.8)`;
+    ctx.beginPath(); ctx.arc(rand() * 512, 380 + rand() * 400, 40 + rand() * 70, 0, Math.PI * 2); ctx.fill();
+  }
+  return c;
+}
+
+// ===========================================================================
+// Scene construction
+// ===========================================================================
+const canvas = document.getElementById("gl");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMappingExposure = 0.78;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xf2ede4);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.30;
+
+const camera = new THREE.PerspectiveCamera(45, W / H, 0.02, 50);
+
+const ROOM = { left: -1.55, right: 1.75, back: 0, front: 4.5, height: 2.75 };
+const WIN = { z0: 0.45, z1: 1.45, y0: 0.95, y1: 2.35 };
+const gilded = [];      // meshes that reflect the captured room
+
+function box(w, h, d, mat, x, y, z) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z); m.castShadow = true; m.receiveShadow = true;
+  scene.add(m); return m;
+}
+
+function buildRoom() {
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0xf3eee6, roughness: 0.92 });
+  // back wall (the mihrab wall)
+  const back = new THREE.Mesh(new THREE.PlaneGeometry(ROOM.right - ROOM.left, ROOM.height), wallMat);
+  back.position.set((ROOM.left + ROOM.right) / 2, ROOM.height / 2, 0);
+  back.receiveShadow = true; scene.add(back);
+  // left wall with a window opening, made of boxes so it blocks the sun
+  const t = 0.18, x = ROOM.left - t / 2;
+  box(t, ROOM.height, WIN.z0, wallMat, x, ROOM.height / 2, WIN.z0 / 2);
+  box(t, ROOM.height, ROOM.front - WIN.z1, wallMat, x, ROOM.height / 2, (WIN.z1 + ROOM.front) / 2);
+  box(t, WIN.y0, WIN.z1 - WIN.z0, wallMat, x, WIN.y0 / 2, (WIN.z0 + WIN.z1) / 2);
+  box(t, ROOM.height - WIN.y1, WIN.z1 - WIN.z0, wallMat, x, (WIN.y1 + ROOM.height) / 2, (WIN.z0 + WIN.z1) / 2);
+  // window frame + mullion
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+  const fz = (WIN.z0 + WIN.z1) / 2, fy = (WIN.y0 + WIN.y1) / 2;
+  box(0.05, WIN.y1 - WIN.y0, 0.05, frameMat, ROOM.left - 0.05, fy, WIN.z0 + 0.025);
+  box(0.05, WIN.y1 - WIN.y0, 0.05, frameMat, ROOM.left - 0.05, fy, WIN.z1 - 0.025);
+  box(0.05, WIN.y1 - WIN.y0, 0.04, frameMat, ROOM.left - 0.05, fy, fz);
+  box(0.05, 0.05, WIN.z1 - WIN.z0, frameMat, ROOM.left - 0.05, WIN.y0 + 0.025, fz);
+  box(0.05, 0.05, WIN.z1 - WIN.z0, frameMat, ROOM.left - 0.05, WIN.y1 - 0.025, fz);
+  box(0.05, 0.035, WIN.z1 - WIN.z0, frameMat, ROOM.left - 0.05, fy + 0.25, fz);
+  box(0.16, 0.03, WIN.z1 - WIN.z0 + 0.1, frameMat, ROOM.left + 0.02, WIN.y0 - 0.015, fz);   // sill
+  // view outside
+  const view = new THREE.Mesh(new THREE.PlaneGeometry(3.0, 3.2),
+    new THREE.MeshBasicMaterial({ map: canvasTexture(windowViewTexture()), toneMapped: false }));
+  view.material.color.setScalar(1.25);
+  view.position.set(ROOM.left - 1.4, fy, fz); view.rotation.y = Math.PI / 2; scene.add(view);
+  // right wall, ceiling
+  const right = new THREE.Mesh(new THREE.PlaneGeometry(ROOM.front, ROOM.height), wallMat);
+  right.position.set(ROOM.right, ROOM.height / 2, ROOM.front / 2); right.rotation.y = -Math.PI / 2;
+  right.receiveShadow = true; scene.add(right);
+  const ceil = new THREE.Mesh(new THREE.PlaneGeometry(ROOM.right - ROOM.left, ROOM.front), wallMat);
+  ceil.position.set((ROOM.left + ROOM.right) / 2, ROOM.height, ROOM.front / 2); ceil.rotation.x = Math.PI / 2; scene.add(ceil);
+  // marble floor
+  const tex = canvasTexture(marbleTexture(), { repeat: [(ROOM.right - ROOM.left) / 0.6, ROOM.front / 0.6] });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(ROOM.right - ROOM.left, ROOM.front),
+    new THREE.MeshStandardMaterial({ map: tex, roughness: 0.22, metalness: 0.0 }));
+  floor.rotation.x = -Math.PI / 2; floor.position.set((ROOM.left + ROOM.right) / 2, 0, ROOM.front / 2);
+  floor.receiveShadow = true; scene.add(floor);
+  // skirting tiles
+  const skirtTex = canvasTexture(marbleTexture(), { repeat: [(ROOM.right - ROOM.left) / 0.6, 0.15] });
+  const skirtMat = new THREE.MeshStandardMaterial({ map: skirtTex, roughness: 0.3 });
+  box(ROOM.right - ROOM.left, 0.085, 0.012, skirtMat, (ROOM.left + ROOM.right) / 2, 0.0425, 0.006);
+  box(0.012, 0.085, ROOM.front, skirtMat, ROOM.left + 0.006, 0.0425, ROOM.front / 2);
+  // curtain (sheer, gently moving)
+  const cg = new THREE.PlaneGeometry(1.45, 2.45, 90, 30);
+  const curtainMat = new THREE.MeshStandardMaterial({
+    map: canvasTexture(curtainTexture()), transparent: true, side: THREE.DoubleSide, roughness: 1,
+    emissive: new THREE.Color(0xfff4e0), emissiveIntensity: 0.55, depthWrite: false });
+  const curtain = new THREE.Mesh(cg, curtainMat);
+  curtain.rotation.y = Math.PI / 2;
+  curtain.position.set(ROOM.left + 0.09, 2.45 / 2 + 0.25, (WIN.z0 + WIN.z1) / 2 + 0.1);
+  curtain.userData.base = cg.attributes.position.array.slice();
+  scene.add(curtain);
+  box(0.02, 0.02, 1.9, frameMat, ROOM.left + 0.09, 2.52, (WIN.z0 + WIN.z1) / 2 + 0.1);  // rod
+  return curtain;
+}
+
+function goldMaterial(alphaTex) {
+  return new THREE.MeshStandardMaterial({
+    color: new THREE.Color(1.0, 0.66, 0.16), metalness: 1.0, roughness: 0.10,
+    alphaMap: alphaTex, alphaTest: 0.5, side: THREE.DoubleSide, envMapIntensity: 1.0 });
+}
+
+function buildMihrab() {
+  const alpha = canvasTexture(drawPanelAlpha(), { srgb: false, aniso: 16 });
+  const geo = new THREE.PlaneGeometry(PANEL_W, PANEL_H);
+  const front = new THREE.Mesh(geo, goldMaterial(alpha));
+  front.position.set(0, PANEL_Y + PANEL_H / 2, 0.009);
+  front.castShadow = true; front.receiveShadow = true;
+  scene.add(front); gilded.push(front);
+  // the acrylic edge: a darker copy just behind
+  const edgeMat = new THREE.MeshStandardMaterial({ color: 0x8a6a2a, metalness: 0.6, roughness: 0.35, alphaMap: alpha, alphaTest: 0.5, side: THREE.DoubleSide });
+  for (const z of [0.0055, 0.0035]) {
+    const e = new THREE.Mesh(geo, edgeMat);
+    e.position.set(0, PANEL_Y + PANEL_H / 2, z); e.castShadow = true;
+    scene.add(e);
+  }
+}
+
+function buildCalligraphy() {
+  const blackMat = new THREE.MeshPhysicalMaterial({ color: 0x040404, roughness: 0.25, clearcoat: 1, clearcoatRoughness: 0.08, envMapIntensity: 0.25 });
+  gilded.push(blackMat);
+  const addPiece = (alphaCanvas, baseGeo, w, h, x, y) => {
+    const base = new THREE.Mesh(baseGeo, blackMat);
+    base.position.set(x, y, 0.006); base.castShadow = true; base.receiveShadow = true; scene.add(base);
+    const gold = new THREE.Mesh(new THREE.PlaneGeometry(w, h), goldMaterial(canvasTexture(alphaCanvas, { srgb: false, aniso: 16 })));
+    gold.position.set(x, y, 0.0095); gold.castShadow = true; scene.add(gold); gilded.push(gold);
+  };
+  const top = PANEL_Y + PANEL_H;
+  // left: Muhammad, right: Allah (as on the wall)
+  const dL = 0.35, dR = 0.39;
+  addPiece(medallionTextures("محمد"), new THREE.CircleGeometry(dL / 2 * 0.985, 96), dL, dL, -0.57, top + 0.35);
+  addPiece(medallionTextures("الله"), new THREE.CircleGeometry(dR / 2 * 0.985, 96), dR, dR, 0.54, top + 0.38);
+  // cartouche: Qur'an 2:144
+  const cw = 0.74, chh = 0.245;
+  const { alpha, shape } = cartoucheTextures("فَوَلِّ وَجْهَكَ شَطْرَ الْمَسْجِدِ الْحَرَامِ", cw, chh);
+  const s = new THREE.Shape(shape.map(([x, y]) => new THREE.Vector2(x * cw / 2 * 0.99, y * chh / 2 * 0.99)));
+  addPiece(alpha, new THREE.ShapeGeometry(s, 24), cw, chh, 0.0, top + 0.155);
+}
+
+function buildRug() {
+  const wM = 0.74, lM = 1.16;
+  const t = rugTextures(wM, lM);
+  const total = lM + 2 * t.fringe;
+  const mat = new THREE.MeshStandardMaterial({
+    map: canvasTexture(t.color), bumpMap: canvasTexture(t.bump, { srgb: false }), bumpScale: 2.5,
+    alphaMap: canvasTexture(t.alpha, { srgb: false }), alphaTest: 0.5, roughness: 1, side: THREE.DoubleSide });
+  const rug = new THREE.Mesh(new THREE.PlaneGeometry(wM, total), mat);
+  rug.rotation.x = -Math.PI / 2;
+  rug.position.set(0.0, 0.009, 0.10 + total / 2);
+  rug.receiveShadow = true; scene.add(rug);
+  // thickness
+  const side = new THREE.Mesh(new THREE.BoxGeometry(wM, 0.008, lM), new THREE.MeshStandardMaterial({ color: 0x5d6448, roughness: 1 }));
+  side.position.set(0, 0.004, 0.10 + total / 2); side.receiveShadow = true; scene.add(side);
+}
+
+function leafGeometry(len, wid) {
+  const s = new THREE.Shape();
+  s.moveTo(0, 0);
+  s.bezierCurveTo(wid * 0.9, len * 0.15, wid * 0.7, len * 0.75, 0, len);
+  s.bezierCurveTo(-wid * 0.7, len * 0.75, -wid * 0.9, len * 0.15, 0, 0);
+  const g = new THREE.ShapeGeometry(s, 14);
+  const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i);
+    p.setZ(i, -0.35 * (y / len) ** 2 * len + Math.abs(x) * 0.35);  // droop + central fold
+  }
+  g.computeVertexNormals();
+  return g;
+}
+
+function buildPlant() {
+  const group = new THREE.Group();
+  const potGeo = new THREE.LatheGeometry([[0, 0], [0.105, 0], [0.12, 0.03], [0.15, 0.26], [0.158, 0.28], [0.15, 0.285], [0.14, 0.27]].map(([x, y]) => new THREE.Vector2(x, y)), 64);
+  const pot = new THREE.Mesh(potGeo, new THREE.MeshPhysicalMaterial({ map: canvasTexture(potTexture()), roughness: 0.25, clearcoat: 0.6 }));
+  pot.castShadow = pot.receiveShadow = true; group.add(pot);
+  const soil = new THREE.Mesh(new THREE.CircleGeometry(0.14, 32), new THREE.MeshStandardMaterial({ color: 0x2d2116, roughness: 1 }));
+  soil.rotation.x = -Math.PI / 2; soil.position.y = 0.26; group.add(soil);
+  const stemMat = new THREE.MeshStandardMaterial({ color: 0x5d6b35, roughness: 0.7 });
+  const leafMats = [0x2f6b2a, 0x3b7d31, 0x285e25, 0x467f2e].map(c => new THREE.MeshStandardMaterial({ color: c, roughness: 0.45, side: THREE.DoubleSide }));
+  const leaves = [];
+  const addStem = (pts, nLeaves, scale) => {
+    const curve = new THREE.CatmullRomCurve3(pts.map(p => new THREE.Vector3(...p)));
+    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, 40, 0.006, 6), stemMat);
+    tube.castShadow = true; group.add(tube);
+    for (let k = 0; k < nLeaves; k++) {
+      const u = 0.25 + 0.75 * (k / nLeaves) + rand() * 0.03;
+      const p = curve.getPoint(Math.min(u, 1));
+      const leaf = new THREE.Mesh(leafGeometry(0.12 * scale * (0.8 + rand() * 0.4), 0.075 * scale), leafMats[k % 4]);
+      leaf.position.copy(p);
+      leaf.rotation.set(-0.6 + rand() * 0.8, (k % 2 ? 1 : -1) * (0.6 + rand() * 1.4) + rand() * 6.28, (k % 2 ? 1 : -1) * (0.7 + rand() * 0.5));
+      leaf.castShadow = true; leaf.receiveShadow = true;
+      leaf.userData.phase = rand() * 6.28; leaf.userData.rot = leaf.rotation.clone();
+      group.add(leaf); leaves.push(leaf);
+    }
+  };
+  addStem([[0, 0.26, 0], [0.02, 0.5, 0.01], [-0.02, 0.75, 0.02], [0.01, 0.98, 0.0]], 14, 1.0);
+  addStem([[0.03, 0.26, 0.02], [0.08, 0.45, 0.04], [0.12, 0.66, 0.06], [0.14, 0.82, 0.05]], 9, 0.95);
+  addStem([[-0.03, 0.26, -0.01], [-0.08, 0.42, 0.02], [-0.12, 0.6, 0.0], [-0.15, 0.74, 0.03]], 8, 0.9);
+  addStem([[0.05, 0.27, 0.06], [0.16, 0.3, 0.14], [0.22, 0.16, 0.2], [0.25, 0.02, 0.22]], 6, 0.85);   // trailing
+  group.position.set(-1.20, 0, 0.42);
+  scene.add(group);
+  return leaves;
+}
+
+function buildRehal() {
+  const group = new THREE.Group();
+  const wood = new THREE.MeshStandardMaterial({ map: canvasTexture(woodTexture()), roughness: 0.45 });
+  const L = 0.36, Wd = 0.21, T = 0.012, ang = 0.72;
+  for (const s of [1, -1]) {
+    const b = new THREE.Mesh(new THREE.BoxGeometry(Wd, L, T), wood);
+    b.rotation.x = s * ang; b.position.y = (L / 2) * Math.cos(ang);
+    b.castShadow = b.receiveShadow = true; group.add(b);
+  }
+  const book = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.24, 0.045),
+    [0, 0, 0, 0, 0, 0].map((_, i) => new THREE.MeshStandardMaterial(i >= 4 ? { map: canvasTexture(bookTexture()), roughness: 0.55 } : { color: i === 0 ? 0xeee6d2 : 0x1f4a3a, roughness: 0.6 })));
+  book.rotation.x = -ang;
+  book.position.set(0, (L / 2) * Math.cos(ang) + 0.07, -0.035);
+  book.castShadow = book.receiveShadow = true; group.add(book);
+  group.position.set(-0.86, 0, 0.30);
+  group.rotation.y = 0.35;
+  scene.add(group);
+}
+
+// sun through the window
+function buildLights() {
+  const sun = new THREE.DirectionalLight(0xffe6c2, 3.2);
+  const dir = new THREE.Vector3(1.55, -0.42, -0.95).normalize();
+  sun.target.position.set(-0.1, 1.15, 0);
+  sun.position.copy(sun.target.position).addScaledVector(dir, -7);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(4096, 4096);
+  const sc = sun.shadow.camera;
+  sc.left = -2.3; sc.right = 2.3; sc.top = 2.3; sc.bottom = -2.3; sc.near = 2; sc.far = 13;
+  sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.0;
+  sun.shadow.radius = 3;
+  scene.add(sun, sun.target);
+  const hemi = new THREE.HemisphereLight(0xfff6ea, 0xd8c8b0, 0.55);
+  scene.add(hemi);
+  // soft bounce from the window side
+  const fill = new THREE.PointLight(0xfff0dc, 1.6, 6, 1.6);
+  fill.position.set(-1.1, 1.8, 1.2); scene.add(fill);
+  return sun;
+}
+
+// light shafts + dust
+function buildAir() {
+  const [c, ctx] = makeCanvas(64, 256);
+  const g = ctx.createLinearGradient(0, 0, 0, 256);
+  g.addColorStop(0, "rgba(255,240,210,0)"); g.addColorStop(0.3, "rgba(255,240,210,0.6)");
+  g.addColorStop(0.75, "rgba(255,240,210,0.35)"); g.addColorStop(1, "rgba(255,240,210,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 256);
+  const g2 = ctx.createLinearGradient(0, 0, 64, 0);
+  g2.addColorStop(0, "rgba(0,0,0,1)"); g2.addColorStop(0.2, "rgba(0,0,0,0)"); g2.addColorStop(0.8, "rgba(0,0,0,0)"); g2.addColorStop(1, "rgba(0,0,0,1)");
+  ctx.globalCompositeOperation = "destination-out"; ctx.fillStyle = g2; ctx.fillRect(0, 0, 64, 256);
+  const shaftMat = new THREE.MeshBasicMaterial({ map: canvasTexture(c), transparent: true, opacity: 0.08, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+  const dir = new THREE.Vector3(1.55, -0.42, -0.95).normalize();
+  const shafts = new THREE.Group();
+  for (let i = 0; i < 5; i++) {
+    const len = 2.4;
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(0.35 + rand() * 0.25, len), shaftMat);
+    const start = new THREE.Vector3(ROOM.left, lerp(WIN.y0 + 0.2, WIN.y1 - 0.1, rand()), lerp(WIN.z0 + 0.1, WIN.z1 - 0.1, rand()));
+    m.position.copy(start).addScaledVector(dir, len / 2);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    m.rotateY(rand() * Math.PI);
+    shafts.add(m);
+  }
+  scene.add(shafts);
+  const N = 500, pos = new Float32Array(N * 3), seeds = [];
+  for (let i = 0; i < N; i++) {
+    const s = [rand(), rand(), rand(), rand()]; seeds.push(s);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  const [dc, dctx] = makeCanvas(32, 32);
+  const dg = dctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+  dg.addColorStop(0, "rgba(255,245,225,1)"); dg.addColorStop(1, "rgba(255,245,225,0)");
+  dctx.fillStyle = dg; dctx.fillRect(0, 0, 32, 32);
+  const dust = new THREE.Points(geo, new THREE.PointsMaterial({ size: 0.006, map: canvasTexture(dc), transparent: true, opacity: 0.7, depthWrite: false, blending: THREE.AdditiveBlending }));
+  scene.add(dust);
+  return { dust, seeds, dir };
+}
+
+// ===========================================================================
+// Shots (the "edit")
+// ===========================================================================
+const SHOTS = [
+  // 1. close glide across the sunlit lattice (upper left of the frame, towards the arch tip)
+  { t0: 0.0, t1: 3.6, fov: 40, a: { p: [-0.62, 1.50, 0.95], l: [-0.34, 1.62, 0] }, b: { p: [0.02, 1.62, 0.85], l: [0.22, 1.66, 0] } },
+  // 2. from under the arch, looking up at the onion tip, pulling back
+  { t0: 3.6, t1: 7.2, fov: 42, a: { p: [0.10, 1.12, 0.80], l: [0.0, 1.58, 0] }, b: { p: [0.02, 1.02, 1.75], l: [0.0, 1.48, 0] } },
+  // 3. calligraphy pan: Muhammad -> cartouche -> Allah
+  { t0: 7.2, t1: 10.6, fov: 38, a: { p: [-0.68, 2.08, 1.35], l: [-0.52, 2.17, 0] }, b: { p: [0.66, 2.10, 1.35], l: [0.50, 2.19, 0] } },
+  // 4. three-quarter view of the corner: window, plant, rehal, rug
+  { t0: 10.6, t1: 15.8, fov: 62, a: { p: [1.60, 1.30, 4.30], l: [-0.75, 1.32, 0.0] }, b: { p: [1.40, 1.30, 3.95], l: [-0.68, 1.32, 0.0] } },
+  // 5. front view, low, slow push-in
+  { t0: 15.8, t1: 20.0, fov: 50, a: { p: [0.0, 0.92, 3.15], l: [0.0, 1.22, 0] }, b: { p: [0.0, 0.98, 2.55], l: [0.0, 1.25, 0] } },
+];
+const DURATION = 20.0;
+
+function setCamera(t) {
+  const s = SHOTS.find(s => t >= s.t0 && t < s.t1) || SHOTS[SHOTS.length - 1];
+  const k = easeIO(prog(t, s.t0, s.t1)) * 0.85 + prog(t, s.t0, s.t1) * 0.15;
+  const p = lerp3(s.a.p, s.b.p, k), l = lerp3(s.a.l, s.b.l, k);
+  // a touch of handheld drift
+  const hx = Math.sin(t * 1.3) * 0.004 + Math.sin(t * 2.9) * 0.002, hy = Math.cos(t * 1.7) * 0.003;
+  camera.position.set(p[0] + hx, p[1] + hy, p[2]);
+  camera.fov = s.fov; camera.updateProjectionMatrix();
+  camera.lookAt(l[0], l[1], l[2]);
+}
+
+// ===========================================================================
+// Build everything
+// ===========================================================================
+let curtain, leaves, sun, air;
+async function setup() {
+  await document.fonts.load("700 100px Amiri", "الله");
+  await document.fonts.load("400 100px Amiri", "الله");
+  curtain = buildRoom();
+  sun = buildLights();
+  buildRug();
+  leaves = buildPlant();
+  buildRehal();
+  buildMihrab();
+  buildCalligraphy();
+  air = buildAir();
+  // capture the real room once, so the mirror gold reflects it
+  const hide = gilded.filter(o => o.isMesh);
+  hide.forEach(o => o.visible = false);
+  air.dust.visible = false;
+  const crt = new THREE.WebGLCubeRenderTarget(512, { type: THREE.HalfFloatType });
+  const cube = new THREE.CubeCamera(0.05, 20, crt);
+  cube.position.set(0.0, 1.35, 1.6);
+  scene.add(cube);
+  cube.update(renderer, scene);
+  const envRoom = pmrem.fromCubemap(crt.texture).texture;
+  hide.forEach(o => { o.visible = true; o.material.envMap = envRoom; o.material.needsUpdate = true; });
+  gilded.filter(o => !o.isMesh).forEach(m => { m.envMap = envRoom; m.needsUpdate = true; });
+  air.dust.visible = true;
+  // grain tiles
+  window.__grain = [];
+  for (let i = 0; i < 6; i++) {
+    const [gc, gx] = makeCanvas(540, 960);
+    const img = gx.createImageData(540, 960);
+    for (let k = 0; k < img.data.length; k += 4) { const v = 128 + (rand() - 0.5) * 255; img.data[k] = img.data[k + 1] = img.data[k + 2] = v; img.data[k + 3] = 255; }
+    gx.putImageData(img, 0, 0); window.__grain.push(gc);
+  }
+}
+
+function animate(t) {
+  setCamera(t);
+  // curtain breathing
+  const pos = curtain.geometry.attributes.position, base = curtain.userData.base;
+  for (let i = 0; i < pos.count; i++) {
+    const x = base[i * 3], y = base[i * 3 + 1];
+    const fold = Math.sin(x * 26) * 0.035 + Math.sin(x * 9 + 1) * 0.02;
+    const breeze = Math.sin(t * 0.9 + x * 3 + y * 0.8) * 0.018 * (1.2 - (y + 1.2) / 2.45);
+    pos.setZ(i, fold + breeze);
+  }
+  pos.needsUpdate = true; curtain.geometry.computeVertexNormals();
+  // leaves sway a little
+  for (const lf of leaves) {
+    const r = lf.userData.rot, ph = lf.userData.phase;
+    lf.rotation.set(r.x + Math.sin(t * 1.1 + ph) * 0.03, r.y, r.z + Math.cos(t * 0.8 + ph) * 0.03);
+  }
+  // sun intensity: a passing thin cloud
+  sun.intensity = 3.2 * (0.9 + 0.1 * Math.sin(t * 0.5));
+  // dust drifting in the sun
+  const dp = air.dust.geometry.attributes.position;
+  air.seeds.forEach((s, i) => {
+    const u = (s[0] + t * 0.012 * (0.5 + s[3])) % 1;
+    const start = [ROOM.left, lerp(WIN.y0, WIN.y1, s[1]), lerp(WIN.z0, WIN.z1, s[2])];
+    const L = u * 2.2;
+    dp.setXYZ(i, start[0] + air.dir.x * L + Math.sin(t * 0.7 + i) * 0.02,
+                 start[1] + air.dir.y * L + Math.sin(t * 0.5 + i * 1.3) * 0.03,
+                 start[2] + air.dir.z * L + Math.cos(t * 0.6 + i) * 0.02);
+  });
+  dp.needsUpdate = true;
+  renderer.render(scene, camera);
+  // grain + fades
+  const g = document.getElementById("grain").getContext("2d");
+  g.drawImage(window.__grain[Math.floor(t * 30) % window.__grain.length], 0, 0);
+  const fade = Math.max(1 - prog(t, 0, 0.5), prog(t, DURATION - 0.8, DURATION));
+  document.getElementById("fade").style.opacity = fade;
+}
+
+window.__dbg = { drawPanelAlpha, medallionTextures, cartoucheTextures };
+window.DURATION = DURATION;
+window.CUTS = SHOTS.map(s => s.t0);
+window.ready = setup().then(() => true);
+window.renderAt = async (t) => {
+  animate(t);
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  return true;
+};
+</script>
+</body>
+</html>
